@@ -1,0 +1,24 @@
+# ===== 虚拟环境与缓存（体积巨大，不入库）=====
+.venv/
+.venv-sheetsage2/
+.hfcache/
+.pipcache/
+.uvcache/
+.tmp/
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 模型权重与生成产物 =====
+models/
+outputs/
+gradio/
+
+# ===== 测试音频 =====
+test_tone.wav
+
+# ===== YuE 上游仓库的 git 元数据与构建产物 =====
+YuE/.git/
+YuE/build/
+YuE/*.egg-info/
+YuE/src/yue2/__pycache__/
