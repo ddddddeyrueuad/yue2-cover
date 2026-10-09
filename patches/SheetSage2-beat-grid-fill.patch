@@ -1,0 +1,77 @@
+git : warning: in the working copy of '.tmp/notation_sheetsage2.orig.py', LF will be replaced by CRLF the next time Git
+ touches it
+所在位置 行:5 字符: 1
++ git diff --no-index --unified=3 -- .tmp/notation_sheetsage2.orig.py . ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of '.tmp/notation_sheetsage2.patched.py', LF will be replaced by CRLF the next time Git to
+uches it
+diff --git a/models/SheetSage2/notation_sheetsage2.py b/models/SheetSage2/notation_sheetsage2.py
+index a4a6da0..e9386a8 100644
+--- a/models/SheetSage2/notation_sheetsage2.py
++++ b/models/SheetSage2/notation_sheetsage2.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import math
+ import os
+ import re
++import sys
+ from collections import Counter
+ from dataclasses import dataclass, replace
+ from io import BytesIO
+@@ -259,7 +260,53 @@ def _parse_beats(entries, path):
+         beats.append(beat)
+     if len(beats) < 2:
+         raise BeatGridError(f"{path}: at least two beat events are required")
+-    return beats
++    return _repair_beat_gaps(beats, path)
++
++
++def _repair_beat_gaps(beats, path):
++    """Fill beat rows dropped by the beat tracker inside a measure.
++
++    On real-world music the decoded beat grid occasionally misses a row (for
++    example IDs [1, 3, 4] inside one measure), which made the whole ABC rebuild
++    abort.  Missing rows are re-created with linearly interpolated times and
++    the following row's meter, keeping the grid self-consistent for measure
++    inference, subbeat alignment and serialization.  A dropped downbeat row is
++    repaired the same way by re-creating beats 1..(next-1) before it.
++    """
++    if len(beats) < 2:
++        return beats
++    repaired = [beats[0]]
++    filled = 0
++    for previous, following in zip(beats, beats[1:]):
++        if following.beat_id > 1 and previous.beat_id >= following.beat_id:
++            span = following.time - previous.time
++            for offset in range(1, following.beat_id):
++                repaired.append(BeatEvent(
++                    time=previous.time + span * offset / following.beat_id,
++                    beat_id=offset,
++                    declared_numerator=following.declared_numerator,
++                    denominator=following.denominator,
++                    line_no=previous.line_no,
++                ))
++                filled += 1
++        else:
++            gap = following.beat_id - previous.beat_id
++            if gap > 1:
++                span = following.time - previous.time
++                for offset in range(1, gap):
++                    repaired.append(BeatEvent(
++                        time=previous.time + span * offset / gap,
++                        beat_id=previous.beat_id + offset,
++                        declared_numerator=following.declared_numerator,
++                        denominator=following.denominator,
++                        line_no=previous.line_no,
++                    ))
++                    filled += 1
++        repaired.append(following)
++    if filled:
++        print(f"SheetSage2: filled {filled} missing beat row(s) in the decoded beat grid ({path})",
++              file=sys.stderr)
++    return repaired
+ 
+ 
+ def read_chords(path: os.PathLike[str] | str) -> list[tuple[float, float, str]]:
