@@ -7,9 +7,10 @@ fully localized WebUI. Chinese original: [README-翻唱部署说明.md](README-�
 ## Pipeline
 
 1. **Upload the source song** (wav / mp3 / flac, any common format)
-2. **Transcribe the melody**: SheetSage2 converts the source song into an ABC melody score (editable by hand)
-3. **Enter the target style + new lyrics**
-4. **Generate the cover**: YuE2-3B (`cot=melody`) sings the new lyrics over the original melody, 48 kHz stereo
+2. **Transcribe melody and chords**: SheetSage2 converts the source song into an ABC score (melody + chord symbols, editable by hand)
+3. **Enter the target style + new lyrics** (strict word-for-word alignment is not required)
+4. **Generate the cover**: YuE2-3B sings the new lyrics over the original melody, 48 kHz stereo. Two modes:
+   **follow the original chord progression** (`cot=full`, reuse the transcribed harmony) or **free accompaniment** (`cot=melody`, chords stripped so the model re-harmonizes in the new style)
 
 ## Starting the app
 
@@ -175,15 +176,24 @@ first — do not lower `ode_steps`, which directly costs audio quality.
 
 ## Cover-quality switches
 
-- **Follow the original accompaniment (Ins voice)**: checked = arrangement close to the original; unchecked = freer arrangement, stronger style shift (`prepare_abc` strips the Ins voice).
-- **Follow the original tempo (`Q:` marker)**: checked = tempo locked to the original; unchecked = tempo driven by the style prompt.
-  Upstream treats tempo and time signature as hard conditions, so releasing these anchors is how you let the style dominate.
+- **Follow the original chord progression (checked by default, `cot=full`)**: when the score carries chord symbols, generation uses the full notation and the cover keeps the original harmony; unchecked, chords are stripped (`cot=melody`) and the model re-harmonizes in the new style. To cover the chord progression, pick "with chords" in step 1.
+- **Follow the original accompaniment (Ins voice)**: checked = arrangement closer to the original, but lyric alignment is constrained by the original note count and syllables can get swallowed; unchecked = more natural singing, freer arrangement.
+- **Follow the original tempo (`Q:` marker)**: checked = tempo locked to the original; unchecked = tempo driven by the style prompt. Upstream treats tempo and time signature as hard conditions, so releasing these anchors is how you let the style dominate.
 - **Style guidance `cfg_scale`** (1.0–10.0, default 1.2): above 1.0 CFG is enabled; higher follows the prompt more strictly but degrades quality past a point.
+
+### Lyric alignment and swallowed syllables
+
+Lyrics **do not** need to align word-for-word with the original ABC: a cover follows the melodic skeleton, the section structure and (optionally) the chord progression, while the model maps syllables onto notes by itself. The tighter the constraints (especially with "follow the accompaniment" checked), the closer the lyric syllable count should be to the melody note count:
+
+- The UI provides an **alignment check**: it compares the note count in the Vocal voice with the lyric syllable count (CJK characters one each, Latin words one each) live, and warns when they differ by more than 15%.
+- **Swallowed syllables** usually mean more syllables than notes: shorten the lyrics, or uncheck "follow the accompaniment" to let the melody stretch.
+- Far fewer syllables than notes produces long holds or gaps: add lyrics or accept the holds.
 
 ## FAQ
 
 - **CUDA OOM**: check the four items under "VRAM budget and tiled decoding"; the query-tiling patch in `nar.py` is the key fix for full-song OOM.
-- **Transcription fails**: make sure `ffmpeg` is on PATH (N-123858 installed here).
+- **Transcription fails**: make sure `ffmpeg` is on PATH (N-123858 installed here); if the with-chords mode fails, retry in melody-only mode.
+- **Swallowed syllables / poor alignment**: see "Lyric alignment and swallowed syllables". Quick fix: follow the alignment-check hint to shorten lyrics, or uncheck "follow the accompaniment"; tightest alignment is expected with Ins followed.
 - **Generation gets truncated**: when the log shows ⚠️, shorten the lyrics or change the seed.
 - **English left in the UI**: the `[YuE2] ...` progress lines come from the upstream library and are expected.
 

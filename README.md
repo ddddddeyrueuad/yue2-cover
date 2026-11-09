@@ -3,8 +3,8 @@
 **中文完整文档 → [README-翻唱部署说明.md](README-翻唱部署说明.md)**
 **Full English docs → [README.en.md](README.en.md)**
 
-上传源歌曲 → SheetSage2 转录出 ABC 旋律曲谱 → 填写目标风格与新歌词 → YuE2-3B（`cot=melody`）按原曲旋律演唱新歌词，输出 48 kHz 立体声翻唱。
-Upload a source song → SheetSage2 transcribes it into an ABC melody score → enter a target style and new lyrics → YuE2-3B (`cot=melody`) sings the new lyrics over the original melody.
+上传源歌曲 → SheetSage2 转录出 ABC 曲谱（旋律 + 和弦标记）→ 填写目标风格与新歌词（无需逐字对齐）→ YuE2-3B 按原曲旋律演唱，可选沿用原曲和弦走向（`cot=full`）或自由伴奏（`cot=melody`），输出 48 kHz 立体声翻唱。
+Upload a source song → SheetSage2 transcribes an ABC score (melody + chord symbols) → enter a target style and new lyrics (no word-for-word alignment needed) → YuE2-3B sings them over the original melody, optionally keeping the original chord progression (`cot=full`) or with free accompaniment (`cot=melody`).
 
 ## 快速开始 / Quick start
 
