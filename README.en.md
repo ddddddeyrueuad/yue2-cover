@@ -39,7 +39,7 @@ automatically protects the local patches; model files are untouched).
 | `setup_download.ps1` | Re-downloads the models if `models\` is incomplete |
 | `YuE\` | Official YuE2 checkout (inference code in `YuE\src\yue2`), already carries the Windows patches |
 | `patches\` | Model-side patch that lives in `models\` (gitignored), re-appliable |
-| `tools\` | VRAM/numerics validation scripts plus the auto-align regression test — the measured numbers below come from them |
+| `tools\` | VRAM/numerics validation scripts plus auto-align and structured-lyrics regression tests — the measured numbers below come from them |
 | `models\YuE2-3B` | YuE2 generation model (7.3 GB) |
 | `models\YuE2-Vae` | YuE2 audio VAE |
 | `models\SheetSage2` | Melody transcription model |
@@ -185,16 +185,27 @@ first — do not lower `ode_steps`, which directly costs audio quality.
 
 Lyrics **do not** need to align word-for-word with the original ABC: a cover follows the melodic skeleton, the section structure and (optionally) the chord progression, while the model maps syllables onto notes by itself. The tighter the constraints (especially with "follow the accompaniment" checked), the closer the lyric syllable count should be to the melody note count:
 
-- The UI provides an **alignment check**: it compares the note count in the Vocal voice with the lyric syllable count (CJK characters one each, Latin words one each) live, and warns when they differ by more than 15%.
+- The **lyrics box takes plain text only**: do not write `[Verse]` / `[Chorus]` tags. The system derives them from the ABC's `% verse` / `% chorus` / `% intro` comments and distributes lyric syllables per section and per measure (see below).
+- The UI provides a **live alignment preview** showing each ABC section → lyric structure mapping and its syllable count.
 - **Swallowed syllables** usually mean more syllables than notes: shorten the lyrics, or uncheck "follow the accompaniment" to let the melody stretch.
 - Far fewer syllables than notes produces long holds or gaps: add lyrics or accept the holds.
+
+### Structured lyrics (score-section driven)
+
+The user supplies plain text; section tags, their order, and how many syllables each section gets are all decided by the score:
+
+- **Section mapping**: `% verse` → `[Verse]`, `% chorus` → `[Chorus]`, `% bridge` → `[Bridge]`; instrumental sections (`% intro`, `% interlude`, `% outro`, `% inst`, …) emit empty tags with no vocals. The order and repetition follow the score exactly (e.g. `verse → chorus → interlude → verse → chorus → outro`).
+- **Phrase-wise distribution**: each singing section receives exactly as many lyric syllables as its Vocal note onsets; the syllables are then split into phrases by per-measure onset counts (one line per measure), so line breaks land on musical phrase boundaries.
+- **Automatic loop padding**: when the total lyric syllables are fewer than the score requires, the complete lyric text is looped in order (repeating the whole text, not one word) so every singing section has words.
+- **Legacy tags**: if old lyrics containing `[Verse]` are pasted in, the tags are stripped and the structure is rebuilt from the score.
+- A score with no `%` comments is treated as a single `[Verse]`.
 
 ### Auto-alignment (🎯 button / on by default before generation)
 
 When you do not want to hand-edit the lyrics, let the tool put the lyric syllable count directly onto the Vocal voice:
 
 - **Rule**: more syllables than notes → long notes are split (same pitch repeated as separate onsets); fewer syllables than notes → adjacent notes are merged (same-pitch pairs first, so no chord symbol is lost); if a measure ends up with a single note, it can be turned into a rest. Only the **note durations of the Vocal voice** change — per-measure total duration, chord symbols, the Ins voice, comments and line structure all stay identical.
-- **Two triggers**: the "🎯 自动对齐（写回曲谱）" button in step 2 rewrites the score box directly (inspect before generating); "生成前自动对齐" is checked by default and runs automatically during generation, logging the result.
+- **Two triggers**: the "🎯 自动对齐（写回曲谱）" button in step 2 rewrites the score box and shows the exact lyrics that will be sent to the model; "生成前自动对齐" is checked by default and runs "note-count alignment → structured-lyric alignment" during generation, logging both.
 - **Reversible**: alignment only stretches/shrinks durations, never changes the pitch sequence; running it twice with the same lyrics is idempotent.
 - **Limits**: measures with grace notes, chord blocks `[CEG]`, cross-bar ties or fractional durations are skipped conservatively, so extreme mismatches may leave a small residue — the report states "还差 N 个 onset".
 - **Hard bounds**: splitting can at most break a note down to one L: unit, and merging can at most reduce a measure to one note, so beyond that range you must adjust lyrics or score by hand.
