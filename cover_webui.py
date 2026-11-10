@@ -199,29 +199,304 @@ def strip_chord_symbols(abc):
     return "\n".join(out)
 
 
-def count_vocal_notes(abc):
-    """统计 Vocal 声部音符发声数（休止符不计；[CEG] 和弦块记 1 个 onset）。
+# ---------------------------------------------------------------- 自动对齐（歌词 ↔ 旋律）
+_MUSIC_TOKEN_RE = re.compile(
+    r'(?P<chord>"[^"]*")'
+    r"|(?P<note>(?:\^{1,2}|_{1,2}|=)?[A-Ga-g][,']*\d*(?:/\d*)?-?)"
+    r"|(?P<rest>[zZx][,']*\d*(?:/\d*)?)"
+    r"|(?P<bar>\[?\|+:?\]?)"
+    r"|(?P<grace>\{[^}]*\})"
+    r"|(?P<deco>![^!]*!)"
+    r"|(?P<block>\[[^\]]*\])"
+    r"|(?P<other>\S)"
+)
 
-    仅用于「咬字对齐」参考提示，不是严格乐理解析。"""
-    total, voice = 0, None
-    for line in _abc_lines(abc):
-        v = _voice_of(line)
+
+def _parse_dur(text):
+    """ABC 时值 → L: 单位的浮点数（支持 8、8/、/2、3/2 等写法）。"""
+    if not text:
+        return 1.0
+    if "/" in text:
+        num, _, den = text.partition("/")
+        return (float(num) if num else 1.0) / (float(den) if den else 2.0)
+    return float(text)
+
+
+def _parse_note(text):
+    """→ (音高文本, 时值, 是否连音到下一个音)。"""
+    m = re.match(r"^(?P<acc>\^{1,2}|_{1,2}|=)?(?P<pitch>[A-Ga-g])(?P<oct>[,']*)"
+                 r"(?P<dur>\d*(?:/\d*)?)(?P<tie>-?)$", text)
+    if not m:
+        raise ValueError(text)
+    pitch = (m.group("acc") or "") + m.group("pitch") + m.group("oct")
+    return pitch, _parse_dur(m.group("dur")), bool(m.group("tie"))
+
+
+def _fmt_note(pitch, dur, tie):
+    return f"{pitch}{int(dur)}{'-' if tie else ''}"
+
+
+def _split_music_line(line):
+    return [(m.lastgroup, m.group(0)) for m in _MUSIC_TOKEN_RE.finditer(line)]
+
+
+def _scan_measure(tokens, prev_tie_out=False):
+    """把一个小节的 token 列表解析成音符 onset 组。
+
+    groups 每组 = 一个发声点（连音链算 1 个）；ok=False 表示该小节含无法安全
+    改写的结构（装饰音群/和弦块/跨小节连音/分数时值），自动对齐会跳过它。
+    """
+    groups, ok = [], True
+    if prev_tie_out:
+        ok = False
+    chord_pending, current, prev_tie = False, None, prev_tie_out
+    for idx, (kind, text) in enumerate(tokens):
+        if kind == "chord":
+            chord_pending = True
+            continue
+        if kind in ("grace", "block", "other"):
+            ok = False
+            if current is not None:
+                groups.append(current)
+                current = None
+            prev_tie = False
+            continue
+        if kind == "deco":
+            continue
+        if kind != "note":
+            if current is not None:
+                groups.append(current)
+                current = None
+            prev_tie = False
+            continue
+        try:
+            pitch, dur, tie = _parse_note(text)
+        except ValueError:
+            ok = False
+            continue
+        if not float(dur).is_integer():
+            ok = False
+        if prev_tie and current is None:
+            prev_tie = tie            # 跨小节连音的延续，不计新 onset
+            continue
+        if current is not None and prev_tie:
+            current["tokens"].append(idx)
+            current["dur"] += dur
+            current["last_tie"] = tie
+        else:
+            if current is not None:
+                groups.append(current)
+            current = {"tokens": [idx], "dur": dur, "pitch": pitch,
+                       "chord": chord_pending, "last_tie": tie}
+            chord_pending = False
+        prev_tie = tie
+    if current is not None:
+        groups.append(current)
+    return groups, ok
+
+
+def _vocal_struct(abc):
+    """把 ABC 拆成结构化行：只有 Vocal 声部的音乐行可被改写，其余原样保留。"""
+    structs, voice = [], None
+    for ln in abc.replace("\r\n", "\n").split("\n"):
+        v = _voice_of(ln)
         if v is not None:
             voice = v
+            structs.append({"kind": "header", "raw": ln})
             continue
-        if voice != "VOCAL":
+        s = ln.strip()
+        if _is_field_header(s) or s.startswith("%"):
+            structs.append({"kind": "other", "raw": ln})
             continue
-        s = line.strip()
-        if _is_field_header(s):          # w:/K:/L: 等字段行
+        if voice and voice.startswith("VOC"):
+            measures, bars, cur = [], [], []
+            for kind, text in _split_music_line(ln):
+                if kind == "bar":
+                    measures.append(cur)
+                    bars.append(text)
+                    cur = []
+                else:
+                    cur.append((kind, text))
+            measures.append(cur)
+            structs.append({"kind": "vocal", "measures": measures, "bars": bars})
+        else:
+            structs.append({"kind": "other", "raw": ln})
+    return structs
+
+
+def _iter_measures(structs):
+    """yield (struct_idx, measure_idx, groups, ok)，并跨小节传递连音状态。"""
+    prev_tie = False
+    for si, st in enumerate(structs):
+        if st["kind"] != "vocal":
             continue
-        s = re.sub(r"%.*", "", s)
-        s = re.sub(r"![^!]*!", "", s)
-        s = re.sub(r"\[[A-Za-z]:[^\]]*\]", "", s)   # 行内字段 [K:G]
-        s = re.sub(r"\{[^}]*\}", "", s)  # 装饰音群
-        s = re.sub(r"\[[^\]]*\]", "C1", s)          # 和弦块 [CEG] 记 1 个 onset
-        s = re.sub(r'"[^"]*"', "", s)    # 和弦标记
-        total += len(_NOTE_RE.findall(s))
-    return total
+        for mi, tokens in enumerate(st["measures"]):
+            groups, ok = _scan_measure(tokens, prev_tie)
+            yield si, mi, groups, ok
+            prev_tie = groups[-1]["last_tie"] if groups else False
+
+
+def _count_onsets(structs):
+    return sum(len(groups) for _, _, groups, _ in _iter_measures(structs))
+
+
+def count_vocal_notes(abc):
+    """Vocal 声部的音符 onset 数（连音链记 1 个，休止符/注释/装饰音不计）。"""
+    try:
+        return _count_onsets(_vocal_struct(abc))
+    except Exception:
+        return 0
+
+
+def _best_merge(structs):
+    """挑一组相邻 onset 合并：优先同音高、其次不吞和弦、再取最短的第二个音。"""
+    best = None
+    for si, mi, groups, ok in _iter_measures(structs):
+        if not ok or len(groups) < 2:
+            continue
+        for gi in range(len(groups) - 1):
+            g1, g2 = groups[gi], groups[gi + 1]
+            if g2["last_tie"]:        # 连到下一小节，合并会破坏连音语义
+                continue
+            key = (0 if g1["pitch"] == g2["pitch"] else 1,
+                   0 if not g2["chord"] else 1, g2["dur"])
+            if best is None or key < best[0]:
+                best = (key, si, mi, gi)
+    return None if best is None else best[1:]
+
+
+def _apply_merge(structs, si, mi, gi):
+    tokens = structs[si]["measures"][mi]
+    groups, _ = _scan_measure(tokens, False)
+    g1, g2 = groups[gi], groups[gi + 1]
+    last = g1["tokens"][-1]
+    pitch = g1["pitch"]
+    text = tokens[last][1]
+    _, last_dur, _ = _parse_note(text)
+    tokens[last] = ("note", _fmt_note(pitch, last_dur + g2["dur"], g1["last_tie"]))
+    for idx in sorted(g2["tokens"], reverse=True):
+        del tokens[idx]
+
+
+def _best_rest_measure(structs):
+    """整小节只有一个 onset 时可整体改为休止（歌词远少于音符时的兜底）。"""
+    best = None
+    for si, mi, groups, ok in _iter_measures(structs):
+        if not ok or len(groups) != 1:
+            continue
+        g = groups[0]
+        if g["last_tie"]:
+            continue
+        key = g["dur"]
+        if best is None or key < best[0]:
+            best = (key, si, mi)
+    return None if best is None else best[1:]
+
+
+def _apply_rest(structs, si, mi):
+    tokens = structs[si]["measures"][mi]
+    groups, _ = _scan_measure(tokens, False)
+    dur = int(groups[0]["dur"])
+    chords = [t for k, t in tokens if k == "chord"]      # 和弦标记保留在小节原位
+    tokens[:] = [("chord", t) for t in chords] + [("rest", "z" if dur == 1 else f"z{dur}")]
+
+
+def _best_split(structs):
+    """挑时值最长的 onset 拆成两个（音节多于音符时用来容纳歌词）。"""
+    best = None
+    for si, mi, groups, ok in _iter_measures(structs):
+        if not ok:
+            continue
+        for gi, g in enumerate(groups):
+            if g["dur"] < 2:
+                continue
+            if best is None or g["dur"] > best[0]:
+                best = (g["dur"], si, mi, gi)
+    return None if best is None else best[1:]
+
+
+def _apply_split(structs, si, mi, gi):
+    tokens = structs[si]["measures"][mi]
+    groups, _ = _scan_measure(tokens, False)
+    g = groups[gi]
+    dur1 = int(g["dur"]) // 2
+    dur2 = int(g["dur"]) - dur1
+    first = g["tokens"][0]
+    pitch = g["pitch"]
+    tokens[first] = ("note", _fmt_note(pitch, dur1, False))
+    for idx in sorted(g["tokens"][1:], reverse=True):
+        del tokens[idx]
+    tokens.insert(first + 1, ("note", _fmt_note(pitch, dur2, False)))
+
+
+def _emit_structs(structs):
+    out = []
+    for st in structs:
+        if st["kind"] != "vocal":
+            out.append(st["raw"])
+            continue
+        parts = []
+        for i, meas in enumerate(st["measures"]):
+            parts.extend(text for _, text in meas)
+            if i < len(st["bars"]):
+                parts.append(st["bars"][i])
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
+def auto_align_abc(abc, lyrics):
+    """把歌词音节数自动落到 Vocal 声部：音节多则拆分长音，音节少则合并/改休止。
+
+    只改 Vocal 声部的音符时值，保持每小节总时值、和弦标记、Ins 声部与注释不变。
+    返回 (新 ABC, 说明文字)。"""
+    target = count_lyric_syllables(lyrics)
+    if target <= 0:
+        return abc, "歌词为空，未做对齐。"
+    structs = _vocal_struct(abc)
+    before = _count_onsets(structs)
+    if before <= 0:
+        return abc, "Vocal 声部没有音符，未做对齐（请确认曲谱包含 Vocal 旋律）。"
+    merges = splits = rests = 0
+    guard = 0
+    while guard < 100000:
+        guard += 1
+        cur = _count_onsets(structs)
+        if cur == target:
+            break
+        cand = _best_merge(structs) if cur > target else None
+        if cand is None and cur > target:
+            cand = _best_rest_measure(structs)
+            if cand is not None:
+                _apply_rest(structs, *cand)
+                rests += 1
+                continue
+        if cand is None and cur < target:
+            cand = _best_split(structs)
+            if cand is not None:
+                _apply_split(structs, *cand)
+                splits += 1
+                continue
+        if cand is not None:
+            _apply_merge(structs, *cand)
+            merges += 1
+            continue
+        break
+    after = _count_onsets(structs)
+    if not (merges or splits or rests):
+        return abc, f"✅ 歌词音节 {target}，Vocal 音符 {before}，数量本就匹配，无需调整。"
+    new_abc = _emit_structs(structs)
+    acts = []
+    if merges:
+        acts.append(f"合并 {merges} 个音符")
+    if splits:
+        acts.append(f"拆分 {splits} 个音符")
+    if rests:
+        acts.append(f"{rests} 个小节改为休止")
+    head = f"歌词音节 {target}，Vocal 音符 {before} → {after}"
+    if after == target:
+        return new_abc, f"✅ 已自动对齐：{head}（{'；'.join(acts)}）。"
+    return new_abc, (f"⚠️ 未能完全对齐：{head}，还差 {abs(target - after)} 个 onset"
+                     f"（受可拆分/合并的音符限制，可手动编辑曲谱）。")
 
 
 def count_lyric_syllables(lyrics):
@@ -240,10 +515,10 @@ def alignment_hint(abc, lyrics, keep_ins):
     pct = (syl - notes) / notes * 100.0
     if pct > 15:
         tip = (f"🎵 对齐检查：歌词音节 ≈ {syl}，Vocal 声部音符 ≈ {notes}（多 {pct:.0f}%）——"
-               "音节明显多于音符时模型会吞字/抢拍。建议精简歌词，或取消勾选「跟随伴奏旋律」让咬字更自由。")
+               "音节多于音符时模型会吞字/抢拍。点「🎯 自动对齐」可拆分长音容纳歌词，或精简歌词。")
     elif pct < -15:
         tip = (f"🎵 对齐检查：歌词音节 ≈ {syl}，Vocal 声部音符 ≈ {notes}（少 {-pct:.0f}%）——"
-               "音节明显少于音符时会出现拖长音或留白，可适当增加歌词。")
+               "音节少于音符时会出现拖长音/留白。点「🎯 自动对齐」可合并多余音符，或适当增加歌词。")
     else:
         tip = f"🎵 对齐检查：歌词音节 ≈ {syl}，Vocal 声部音符 ≈ {notes}，数量接近，咬字对齐应较自然。"
     if keep_ins and abs(pct) > 15:
@@ -300,7 +575,7 @@ def prepare_abc(abc, keep_ins, keep_tempo, keep_chords):
     return "\n".join(out), "；".join(notes), cot
 
 
-def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, cfg_scale):
+def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, auto_align, cfg_scale):
     if not abc or not abc.strip():
         return None, "缺少 ABC 曲谱。请先转录，或手动粘贴曲谱。", model_status_text()
     if not style or not style.strip():
@@ -313,6 +588,10 @@ def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, 
     try:
         pipe = load_pipeline()
         seed = int(seed or 831001)
+        align_note = ""
+        if auto_align:
+            abc, align_note = auto_align_abc(abc, lyrics)
+            log("自动对齐：" + align_note)
         abc, prep_note, cot = prepare_abc(abc, bool(keep_ins), bool(keep_tempo), bool(keep_chords))
         if prep_note:
             log("曲谱预处理：" + prep_note)
@@ -346,6 +625,7 @@ def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, 
         log(f"翻唱生成完成，用时 {time.time() - t0:.1f} 秒，音频 {secs:.1f} 秒。")
         return str(wav), (f"✅ 生成完成：时长 {secs:.1f} 秒，用时 {time.time() - t0:.0f} 秒。"
                           f"产物目录：{out}{warn}"
+                          + (f"\n自动对齐：{align_note}" if align_note else "")
                           + (f"\n曲谱预处理：{prep_note}" if prep_note else "")), model_status_text()
     except InterruptedError:
         return None, "已取消生成。", model_status_text()
@@ -360,6 +640,21 @@ def cancel_generation():
     _cancel.set()
     log("已请求取消生成……")
     return "已请求取消，将在当前 token/步骤后停止。"
+
+
+def auto_align_ui(abc, lyrics):
+    """手动触发：把歌词音节对齐到曲谱并写回曲谱框，便于检查后再生成。"""
+    if not abc or not abc.strip():
+        return abc, "缺少 ABC 曲谱，无法对齐。"
+    if not lyrics or not lyrics.strip():
+        return abc, "请先填写歌词。"
+    try:
+        new_abc, report = auto_align_abc(abc, lyrics)
+        log("自动对齐：" + report)
+        return new_abc, report
+    except Exception as exc:
+        log(traceback.format_exc())
+        return abc, f"自动对齐失败：{exc}"
 
 
 def poll_log(last):
@@ -418,6 +713,11 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
             style_in = gr.Textbox(label="目标风格描述（英文效果最佳）", lines=3, value=EXAMPLE_STYLE)
             lyrics_in = gr.Textbox(label="歌词（无需与原曲逐字对齐，模型按旋律自动咬字）", lines=12)
             align_out = gr.Textbox(label="咬字对齐检查（参考）", lines=2, interactive=False)
+            with gr.Row():
+                btn_align = gr.Button("🎯 自动对齐（写回曲谱）")
+                auto_align_in = gr.Checkbox(value=True, label="生成前自动对齐",
+                                            info="按歌词音节数自动合并/拆分 Vocal 音符，减少吞字与拖腔；"
+                                                 "只改音符时值，保持每小节总时值与和弦标记不变")
             seed_in = gr.Number(value=831001, precision=0, label="随机种子 seed")
             with gr.Row():
                 keep_ins_in = gr.Checkbox(value=False, label="跟随原曲伴奏旋律（Ins 声部）",
@@ -449,8 +749,9 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
                          outputs=[abc_out, step1_info, status_md])
     btn_generate.click(generate_cover,
                        inputs=[style_in, lyrics_in, abc_out, seed_in, keep_ins_in, keep_tempo_in,
-                               keep_chords_in, cfg_in],
+                               keep_chords_in, auto_align_in, cfg_in],
                        outputs=[audio_out, step2_info, status_md])
+    btn_align.click(auto_align_ui, inputs=[abc_out, lyrics_in], outputs=[abc_out, align_out])
     btn_cancel.click(cancel_generation, outputs=[step2_info])
     btn_preload.click(preload_model, outputs=[preload_info, status_md])
     for comp in (abc_out, lyrics_in, keep_ins_in):

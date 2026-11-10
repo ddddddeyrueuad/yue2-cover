@@ -39,7 +39,7 @@ automatically protects the local patches; model files are untouched).
 | `setup_download.ps1` | Re-downloads the models if `models\` is incomplete |
 | `YuE\` | Official YuE2 checkout (inference code in `YuE\src\yue2`), already carries the Windows patches |
 | `patches\` | Model-side patch that lives in `models\` (gitignored), re-appliable |
-| `tools\` | VRAM / numerics validation scripts — the measured numbers below come from them |
+| `tools\` | VRAM/numerics validation scripts plus the auto-align regression test — the measured numbers below come from them |
 | `models\YuE2-3B` | YuE2 generation model (7.3 GB) |
 | `models\YuE2-Vae` | YuE2 audio VAE |
 | `models\SheetSage2` | Melody transcription model |
@@ -189,11 +189,21 @@ Lyrics **do not** need to align word-for-word with the original ABC: a cover fol
 - **Swallowed syllables** usually mean more syllables than notes: shorten the lyrics, or uncheck "follow the accompaniment" to let the melody stretch.
 - Far fewer syllables than notes produces long holds or gaps: add lyrics or accept the holds.
 
+### Auto-alignment (🎯 button / on by default before generation)
+
+When you do not want to hand-edit the lyrics, let the tool put the lyric syllable count directly onto the Vocal voice:
+
+- **Rule**: more syllables than notes → long notes are split (same pitch repeated as separate onsets); fewer syllables than notes → adjacent notes are merged (same-pitch pairs first, so no chord symbol is lost); if a measure ends up with a single note, it can be turned into a rest. Only the **note durations of the Vocal voice** change — per-measure total duration, chord symbols, the Ins voice, comments and line structure all stay identical.
+- **Two triggers**: the "🎯 自动对齐（写回曲谱）" button in step 2 rewrites the score box directly (inspect before generating); "生成前自动对齐" is checked by default and runs automatically during generation, logging the result.
+- **Reversible**: alignment only stretches/shrinks durations, never changes the pitch sequence; running it twice with the same lyrics is idempotent.
+- **Limits**: measures with grace notes, chord blocks `[CEG]`, cross-bar ties or fractional durations are skipped conservatively, so extreme mismatches may leave a small residue — the report states "还差 N 个 onset".
+- **Hard bounds**: splitting can at most break a note down to one L: unit, and merging can at most reduce a measure to one note, so beyond that range you must adjust lyrics or score by hand.
+
 ## FAQ
 
 - **CUDA OOM**: check the four items under "VRAM budget and tiled decoding"; the query-tiling patch in `nar.py` is the key fix for full-song OOM.
 - **Transcription fails**: make sure `ffmpeg` is on PATH (N-123858 installed here); if the with-chords mode fails, retry in melody-only mode.
-- **Swallowed syllables / poor alignment**: see "Lyric alignment and swallowed syllables". Quick fix: follow the alignment-check hint to shorten lyrics, or uncheck "follow the accompaniment"; tightest alignment is expected with Ins followed.
+- **Swallowed syllables / poor alignment**: see "Lyric alignment and swallowed syllables". Quick fix: press "🎯 自动对齐" (or keep "生成前自动对齐" checked), shorten the lyrics, or uncheck "follow the accompaniment"; tightest alignment is expected with Ins followed.
 - **Generation gets truncated**: when the log shows ⚠️, shorten the lyrics or change the seed.
 - **English left in the UI**: the `[YuE2] ...` progress lines come from the upstream library and are expected.
 
