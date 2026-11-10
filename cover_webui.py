@@ -771,7 +771,8 @@ def _llm_messages(grid, lyrics):
     system = (
         "你是中文/英文歌曲的作词与改编助手。任务：把用户歌词改编成能贴着给定旋律网格演唱的版本。\n"
         "硬性要求：\n"
-        "1) 段落标记与顺序必须与网格完全一致；标注为乐器段的段落不要写歌词；\n"
+        "1) 只输出歌唱段（网格里给了目标音节数的段），顺序必须与网格一致；"
+        "标注为乐器段的段落可以整段省略，也可以保留一个空标记；段落标记可带序号如 [Verse 1]；\n"
         "2) 每个歌唱段的行数必须与网格给出的行数完全一致；\n"
         "3) 每行音节数尽量等于该行目标值（±1 可接受）；中文一字符一音节，英文按实际发音音节；\n"
         "4) 尽量保留用户原句与原意，只做必要的断句、增删字或整句重复，不要重新创作整首；\n"
@@ -823,17 +824,29 @@ def parse_structured_lyrics(text):
     return sections
 
 
+def _base_tag(tag):
+    """归一化段落标记：[Verse 1]/[Verse 2] → Verse，[Chorus] → Chorus。"""
+    return re.sub(r"[\s\d#]+$", "", (tag or "").strip()).strip()
+
+
 def validate_structured(text, grid):
-    """校验 LLM 输出是否满足网格：段落顺序、行数、每行音节接近目标。"""
-    got = parse_structured_lyrics(text)
-    if len(got) != len(grid):
-        return False, f"段落数 {len(got)} != 期望 {len(grid)}"
-    for (tag, lines), g in zip(got, grid):
-        if tag != g["tag"]:
+    """校验 LLM 输出是否满足网格：歌唱段顺序、行数、每行音节接近目标。
+
+    宽容两类无害差异：
+    1) 乐器段（Intro/Inst/Outro）可以省略，也可以保留空标记——它们没有歌词；
+    2) 段落标记可带序号（[Verse 1]/[Verse 2]），按基础名比较。"""
+    got = [(t, [ln for ln in ls if ln.strip()]) for t, ls in parse_structured_lyrics(text)]
+    got = [(t, ls) for t, ls in got if ls]            # 只看有歌词的段
+    want = [g for g in grid if g["targets"]]           # 只比较歌唱段
+    if len(got) != len(want):
+        return False, (f"歌唱段数 {len(got)} != 期望 {len(want)}"
+                       f"（期望顺序 {[g['tag'] for g in want]}，实际 {[t for t, _ in got]}）")
+    for (tag, lines), g in zip(got, want):
+        if _base_tag(tag) != g["tag"]:
             return False, f"段落标记 {tag} != 期望 {g['tag']}"
-        want = len(g["targets"])
-        if len(lines) != want:
-            return False, f"[{tag}] 行数 {len(lines)} != 期望 {want}"
+        want_n = len(g["targets"])
+        if len(lines) != want_n:
+            return False, f"[{tag}] 行数 {len(lines)} != 期望 {want_n}"
         for j, (ln, t) in enumerate(zip(lines, g["targets"]), 1):
             syl = count_lyric_syllables(ln)
             if abs(syl - t) > max(2, int(t * 0.35)):
@@ -922,14 +935,15 @@ def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, 
         pipe = load_pipeline()
         seed = int(seed or 831001)
         align_note = ""
+        raw_lyrics = lyrics
         if auto_align:
             # ① 结构化歌词：曲谱段落 → [Verse]/[Chorus] 与逐行歌词（不改原曲音符）
-            lyrics, struct_note = align_lyrics_to_abc(abc, lyrics)
+            lyrics, struct_note = align_lyrics_to_abc(abc, raw_lyrics)
             log("歌词结构对齐：" + struct_note)
             align_note = struct_note
-            # ② 可选：LLM 把歌词改写成贴合网格的版本（失败自动回落到 ①）
+            # ② 可选：LLM 把**原始歌词**改写成贴合网格的版本（失败自动回落到 ①）
             if llm_on:
-                llm_lyrics, llm_note = llm_adapt_lyrics(abc, lyrics, llm_base, llm_key, llm_model)
+                llm_lyrics, llm_note = llm_adapt_lyrics(abc, raw_lyrics, llm_base, llm_key, llm_model)
                 if llm_lyrics:
                     lyrics = llm_lyrics
                     log("LLM 改词：" + llm_note)
@@ -1025,12 +1039,13 @@ def llm_preview(abc, lyrics, base, key, model):
     if not lyrics or not lyrics.strip():
         return "请先填写歌词。"
     structured, report = align_lyrics_to_abc(abc, lyrics)
-    text, note = llm_adapt_lyrics(abc, structured, base, key, model)
+    text, note = llm_adapt_lyrics(abc, lyrics, base, key, model)   # 用原始歌词改写
     if not text:
         return (f"{report}\n\n❌ LLM 改词未采用：{note}\n"
                 f"（生成时会回落到上面的本地确定性结果）")
     log("LLM 试跑成功：" + note)
-    return (f"{report}\n\n✅ LLM 改词（{note}），生成时实际发送：\n\n{text}")
+    return (f"{report}\n\n✅ LLM 改词（{note}），生成时实际发送：\n\n{text}\n\n"
+            f"—— 本地确定性结果（LLM 失败时的回退）——\n{structured}")
 
 
 def poll_log(last):

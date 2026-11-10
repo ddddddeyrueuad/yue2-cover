@@ -206,8 +206,8 @@ The user supplies plain text; section tags, their order, and how many syllables 
 The official skill assigns "turn the lyrics into something singable over the phrases" to an agent (LLM) — `editing-workflows.md` asks to check syllable count, lexical stress, consonant density on short notes, vowels on held notes and breathing points, and states that matching the total syllable count alone is insufficient. This tool follows that split:
 
 1. **Code owns structure**: it computes the grid (section order, lines per section, target syllables per line) deterministically;
-2. **LLM owns rewriting**: the grid plus your lyrics go to the LLM with minimal-change instructions;
-3. **Code validates again**: section order, line counts and per-line syllables must fit; otherwise it **falls back to the deterministic result**, so generation never fails because of the LLM.
+2. **LLM owns rewriting**: the grid plus your **original lyrics** go to the LLM with minimal-change instructions;
+3. **Code validates again**: singing-section order, line counts and per-line syllables must fit; otherwise it **falls back to the deterministic result**, so generation never fails because of the LLM. Validation tolerates two harmless differences: empty instrumental sections (`[Intro]`/`[Inst]`/`[Outro]`) may be omitted, and tags may carry numbers (`[Verse 1]`/`[Verse 2]`) — LLMs do this often and it should not discard a valid rewrite.
 
 Fill in the endpoint (default `https://api.deepseek.com/v1`), model and API key (or `LLM_API_KEY`) in the "🤖 LLM 改词" panel, enable it, and it runs during generation; "🧪 试跑 LLM 改词" previews without generation cost.
 

@@ -5,6 +5,7 @@
 不需要真实 API key，也不产生费用。
 """
 import json
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -24,7 +25,20 @@ CAPTURED = {}
 
 
 def build_valid_lyrics():
-    """按网格造一份合格歌词：每行音节数 = 目标值。"""
+    """按网格造一份合格歌词：只写歌唱段（乐器段省略——真实 LLM 常见行为）。"""
+    out = []
+    for g in GRID:
+        if not g["targets"]:
+            continue
+        out.append(f"[{g['tag']}]")
+        for t in g["targets"]:
+            out.append("词" * t)
+        out.append("")
+    return "\n".join(out)
+
+
+def build_with_empty_inst():
+    """保留空乐器段标记的变体，校验器也应接受。"""
     out = []
     for g in GRID:
         out.append(f"[{g['tag']}]")
@@ -32,6 +46,18 @@ def build_valid_lyrics():
             out.append("词" * t)
         out.append("")
     return "\n".join(out)
+
+
+def build_numbered():
+    """段落带序号（[Verse 1]/[Verse 2]）的变体，校验器也应接受。"""
+    txt, counts = build_valid_lyrics(), {}
+
+    def repl(m):
+        tag = m.group(1)
+        counts[tag] = counts.get(tag, 0) + 1
+        return f"[{tag} {counts[tag]}]" if tag == "Verse" else f"[{tag}]"
+
+    return re.sub(r"\[(Verse|Chorus)\]", repl, txt)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,6 +125,30 @@ assert text4 is None
 print("\n=== 5. 空 key 不发请求 ===")
 text5, note5 = cw.llm_adapt_lyrics(real, CN, base + "/v1", "  ", "m")
 assert text5 is None and "key" in note5.lower()
+
+print("\n=== 6. 校验器容忍无害变体（真实 LLM 常见输出） ===")
+ok_a, why_a = cw.validate_structured(build_valid_lyrics(), GRID)      # 省略空乐器段
+print("省略乐器段:", ok_a, why_a)
+assert ok_a, why_a
+ok_b, why_b = cw.validate_structured(build_with_empty_inst(), GRID)   # 保留空乐器段
+print("保留空乐器段:", ok_b, why_b)
+assert ok_b, why_b
+ok_c, why_c = cw.validate_structured(build_numbered(), GRID)          # 段落带序号
+print("段落带序号:", ok_c, why_c)
+assert ok_c, why_c
+
+print("\n=== 7. 真正的结构错误仍应拒绝 ===")
+sing = [g for g in GRID if g["targets"]]
+missing = build_valid_lyrics().replace("\n".join("词" * t for t in sing[0]["targets"]),
+                                       "\n".join("词" * t for t in sing[0]["targets"][:-1]), 1)
+ok_d, why_d = cw.validate_structured(missing, GRID)
+print("缺行:", ok_d, why_d)
+assert not ok_d
+swapped = "\n".join(f"[{g['tag']}]\n" + "\n".join("词" * t for t in g["targets"]) + "\n"
+                    for g in [sing[1]] + [sing[0]] + sing[2:])
+ok_e, why_e = cw.validate_structured(swapped, GRID)
+print("段落顺序错:", ok_e, why_e)
+assert not ok_e
 
 srv.shutdown()
 print("\nALL OK")
