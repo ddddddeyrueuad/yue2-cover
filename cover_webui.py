@@ -551,33 +551,38 @@ def _section_tag(label):
 
 
 def abc_sections(abc):
-    """按 % 段落注释把 Vocal 声部切成 (标签, 该段 onset 数, 该段每小节 onset 数列表)。
+    """按 % 段落注释把 Vocal 声部切成 (标签, [(每行 onset 数, 该行小节数), ...]) 列表。
 
-    跨小节连音状态在整首谱内连续传递；纯休止小节不承载歌词，会被过滤。
-    无 % 注释时整首视为一个 Verse。"""
+    分配单位是 **ABC 音乐行**（官方原生记谱每行 4 小节），不是单个小节——
+    模型的歌词行与曲谱行是同粒度对应，这是官方原始歌词的形态
+    （实测：原曲歌词 28 行 ↔ 歌唱段 30 个音乐行）。
+    跨小节连音状态在整首谱内连续传递；纯休止行不承载歌词。"""
     structs = _vocal_struct(abc)
     sections, current, prev_tie = [], None, False
     for st in structs:
         if st["kind"] == "other" and st["raw"].strip().startswith("%"):
-            current = {"label": st["raw"].strip()[1:].strip(), "bars": []}
+            current = {"label": st["raw"].strip()[1:].strip(), "lines": []}
             sections.append(current)
             prev_tie = False
             continue
         if st["kind"] != "vocal":
             continue
         if current is None:
-            current = {"label": "verse", "bars": []}
+            current = {"label": "verse", "lines": []}
             sections.append(current)
+        line_onsets, line_bars = 0, 0
         for tokens in st["measures"]:
             groups, _ = _scan_measure(tokens, prev_tie)
-            current["bars"].append(len(groups))
+            line_onsets += len(groups)
+            line_bars += 1
             prev_tie = groups[-1]["last_tie"] if groups else False
+        current["lines"].append((line_onsets, line_bars))
     if not sections:
-        sections = [{"label": "verse", "bars": []}]
+        sections = [{"label": "verse", "lines": []}]
     out = []
     for s in sections:
-        bars = [b for b in s["bars"] if b > 0]
-        out.append((s["label"], sum(bars), bars))
+        lines = [(o, b) for o, b in s["lines"] if o > 0]
+        out.append((s["label"], lines))
     return out
 
 
@@ -602,39 +607,6 @@ def _line_units(lines):
     return [_syllable_units(ln) for ln in lines]
 
 
-def _natural_cuts(line_units, bar_counts):
-    """在每个段落内，按小节 onset 数把歌词切成乐句（切点尽量落在原始行边界）。
-
-    返回 [[(音节文本, ...), ...], ...]，逐段对应；不足时自动循环补齐。"""
-    total_needed = sum(sum(b) for b in bar_counts)
-    flat = [u for lu in line_units for u in lu]
-    if not flat or total_needed <= 0:
-        return []
-    # 循环补齐曲谱所需音节
-    repeated = []
-    while len(repeated) < total_needed:
-        repeated.extend(flat)
-    pool = repeated[:total_needed]
-    # 原始行边界（累计音节位置），用于优先断句
-    boundaries = set()
-    acc = 0
-    for lu in line_units:
-        acc += len(lu)
-        boundaries.add(acc)
-    cuts, pos = [], 0
-    for sec_bars in bar_counts:
-        sec_cuts = []
-        for n in sec_bars:
-            if n <= 0:
-                sec_cuts.append([])
-                continue
-            end = min(pos + n, total_needed)
-            sec_cuts.append([u[0] for u in pool[pos:end]])
-            pos = end
-        cuts.append(sec_cuts)
-    return cuts
-
-
 def _join_units(units):
     """把音节单元拼回可读文本：CJK 相连不加空格，拉丁词用空格。"""
     out = ""
@@ -649,62 +621,75 @@ def _join_units(units):
     return out
 
 
-def align_lyrics_to_abc(abc, lyrics):
-    """由 ABC 谱自动生成结构化歌词（段落标记 + 按乐句分行）。
+def _distribute_by_lines(line_onsets, units, boundaries):
+    """把音节池按「每个曲谱行的 onset 数」切成歌词行。
 
-    用户歌词框只收纯歌词文本；段落标记、段落顺序、每段歌词量全部由曲谱的
-    % section 注释与各段 Vocal 音符数决定。乐器段落输出空标记；歌词不足时
+    严格保证每行音节数 == 该行 onset 数（这是对齐的核心不变量）。
+    若某行的切点恰好落在用户原始行边界上，则该行保持原始断句语义。
+    返回 [[音节文本, ...], ...]（长度 = 行数）。"""
+    total = sum(line_onsets)
+    flat = [u[0] for lu in units for u in lu]
+    if not flat or total <= 0:
+        return []
+    pool = []
+    while len(pool) < total:
+        pool.extend(flat)
+    pool = pool[:total]
+    result, pos = [], 0
+    for o in line_onsets:
+        end = min(pos + o, len(pool))
+        result.append(pool[pos:end])
+        pos = end
+    if pos < len(pool):
+        result[-1] = result[-1] + pool[pos:]
+    return result
+
+
+def align_lyrics_to_abc(abc, lyrics):
+    """由 ABC 谱自动生成结构化歌词（段落标记 + 与曲谱行一一对应的歌词行）。
+
+    用户歌词框只收纯歌词文本；段落标记、段落顺序、每行歌词量全部由曲谱的
+    % section 注释与各行 Vocal 音符数决定。乐器段落输出空标记；歌词不足时
     自动循环补齐。返回 (结构化歌词, 预览文本)。"""
     sections = abc_sections(abc)
     if not sections:
         return lyrics, "曲谱没有可识别的 Vocal 段落，未做结构化对齐。"
-    sing = [(i, label, n, bars) for i, (label, n, bars) in enumerate(sections)
-            if _section_tag(label) not in _INST_TAGS and n > 0]
+    sing = [(i, label, lines) for i, (label, lines) in enumerate(sections)
+            if _section_tag(label) not in _INST_TAGS and sum(o for o, _ in lines) > 0]
     if not sing:
         return lyrics, "曲谱没有歌唱段落（全为乐器段），未做结构化对齐。"
-    lines = _split_lyric_lines(lyrics)
-    if not lines:
+    lines_txt = _split_lyric_lines(lyrics)
+    if not lines_txt:
         return lyrics, "歌词为空，未做结构化对齐。"
-    units = _line_units(lines)
+    units = _line_units(lines_txt)
     total_syllables = sum(len(u) for u in units)
-    # 核心：每个歌唱段的歌词音节数 = 该段 Vocal 音符 onset 数（一一对应），
-    # 这样歌词数量与乐句长度严格吻合，不再按歌词总量比例分配造成错位。
-    flat = [u for lu in units for u in lu]
-    pool_idx = 0
-    seg_units = {}
-    for i, label, n, bars in sing:
-        # 依次取用户歌词的每个音节；用完一轮后从头循环（整体重复，而非重复单字）
-        seq = [flat[(pool_idx + j) % len(flat)][0] for j in range(n)]
-        pool_idx += n
-        seg = []
-        pos = 0
-        for cnt in bars:
-            if cnt <= 0:
-                continue
-            seg.append(seq[pos:pos + cnt])
-            pos += cnt
-        if pos < len(seq):
-            seg.append(seq[pos:])
-        seg_units[i] = seg
-    total_w = sum(n for _, _, n, _ in sing)
+    boundaries, acc = set(), 0
+    for lu in units:
+        acc += len(lu)
+        boundaries.add(acc)
+    total_onsets = sum(o for _, _, ls in sing for o, _ in ls)
+    seg_lines = {}
+    for i, label, ls in sing:
+        seg_lines[i] = _distribute_by_lines([o for o, _ in ls], units, boundaries)
     # 拼装：乐器段落输出空标记
     out_lines, preview = [], []
-    for i, (label, n, bars) in enumerate(sections):
+    for i, (label, ls) in enumerate(sections):
         tag = _section_tag(label)
         out_lines.append(f"[{tag}]")
-        if i in seg_units:
-            seg = seg_units[i]
+        if i in seg_lines:
+            seg = seg_lines[i]
             for phrase in seg:
                 out_lines.append(_join_units(phrase))
-            preview.append(f"[{tag}] {n} 音符 → {len(seg)} 句 / {sum(len(p) for p in seg)} 音节")
+            got = sum(len(p) for p in seg)
+            preview.append(f"[{tag}] {len(ls)} 行 / {sum(o for o, _ in ls)} 音符 → {len(seg)} 句 / {got} 音节")
         else:
-            preview.append(f"[{tag}] {n} 音符 → 乐器段，无歌词")
+            preview.append(f"[{tag}] 乐器段，无歌词")
         out_lines.append("")
     result = "\n".join(out_lines).rstrip() + "\n"
     report = ("✅ 已按曲谱自动对齐歌词结构：" + "；".join(preview)
-              + (f"。原始歌词 {total_syllables} 音节，曲谱歌唱段共需 {total_w} 个 onset，"
-                 "已自动循环补齐。" if total_syllables < total_w else
-                 f"。原始歌词 {total_syllables} 音节 / 曲谱歌唱段 {total_w} 个 onset。"))
+              + (f"。原始歌词 {total_syllables} 音节，曲谱歌唱段共 {total_onsets} 个 onset，"
+                 "已自动循环补齐。" if total_syllables < total_onsets else
+                 f"。原始歌词 {total_syllables} 音节 / 曲谱歌唱段 {total_onsets} 个 onset。"))
     return result, report
 
 
@@ -757,7 +742,7 @@ def prepare_abc(abc, keep_ins, keep_tempo, keep_chords):
     return "\n".join(out), "；".join(notes), cot
 
 
-def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, auto_align, cfg_scale):
+def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, auto_align, fit_notes, cfg_scale):
     if not abc or not abc.strip():
         return None, "缺少 ABC 曲谱。请先转录，或手动粘贴曲谱。", model_status_text()
     if not style or not style.strip():
@@ -772,13 +757,15 @@ def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, 
         seed = int(seed or 831001)
         align_note = ""
         if auto_align:
-            # ① 音符数对齐（按纯歌词音节的全局数量）
-            abc, align_note = auto_align_abc(abc, lyrics)
-            log("音符对齐：" + align_note)
-            # ② 段落/乐句结构对齐（纯歌词 → 曲谱 % 段落驱动的 [Verse]/[Chorus] 结构）
+            # ① 结构化歌词：曲谱段落 → [Verse]/[Chorus] 与逐行歌词（不改原曲音符）
             lyrics, struct_note = align_lyrics_to_abc(abc, lyrics)
             log("歌词结构对齐：" + struct_note)
-            align_note = (align_note + "；" + struct_note).strip("；")
+            align_note = struct_note
+            # ② 可选：按歌词音节数改写音符时值（会改变原曲节奏，默认关闭）
+            if fit_notes:
+                abc, fit_note = auto_align_abc(abc, lyrics)
+                log("音符时值改写：" + fit_note)
+                align_note = (align_note + "；" + fit_note).strip("；")
         abc, prep_note, cot = prepare_abc(abc, bool(keep_ins), bool(keep_tempo), bool(keep_chords))
         if prep_note:
             log("曲谱预处理：" + prep_note)
@@ -830,18 +817,16 @@ def cancel_generation():
 
 
 def auto_align_ui(abc, lyrics):
-    """手动触发：把歌词音节对齐到曲谱并写回曲谱框，同时给出结构化歌词预览。"""
+    """手动触发：按曲谱生成结构化歌词并展示（不改动原曲音符）。"""
     if not abc or not abc.strip():
         return abc, "缺少 ABC 曲谱，无法对齐。"
     if not lyrics or not lyrics.strip():
         return abc, "请先填写歌词。"
     try:
-        new_abc, report = auto_align_abc(abc, lyrics)
-        structured, struct_report = align_lyrics_to_abc(new_abc, lyrics)
-        log("音符对齐：" + report)
-        log("歌词结构对齐：" + struct_report)
-        full = report + "\n\n" + struct_report + "\n\n—— 生成时实际发送给模型的歌词 ——\n" + structured
-        return new_abc, full
+        structured, report = align_lyrics_to_abc(abc, lyrics)
+        log("歌词结构对齐：" + report)
+        full = report + "\n\n—— 生成时实际发送给模型的歌词 ——\n" + structured
+        return abc, full
     except Exception as exc:
         log(traceback.format_exc())
         return abc, f"自动对齐失败：{exc}"
@@ -915,9 +900,13 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
             lyrics_in = gr.Textbox(label="歌词（只输入歌词正文，不要写 [Verse]/[Chorus] 等段落标记；系统按 ABC 谱自动对齐段落）", lines=12)
             align_out = gr.Textbox(label="对齐预览（曲谱段落 → 歌词结构）", lines=5, interactive=False)
             with gr.Row():
-                btn_align = gr.Button("🎯 自动对齐（写回曲谱）")
+                btn_align = gr.Button("🎯 自动对齐（生成结构化歌词）")
                 auto_align_in = gr.Checkbox(value=True, label="生成前自动对齐",
-                                            info="按曲谱自动合并/拆分 Vocal 音符，并由 ABC 的 % 段落生成 [Verse]/[Chorus] 结构与乐句分行")
+                                            info="按 ABC 的 % 段落自动生成 [Verse]/[Chorus] 结构，"
+                                                 "并把歌词逐行分配到曲谱行（不改动原曲音符）")
+                fit_notes_in = gr.Checkbox(value=False, label="同时按歌词量改写音符时值",
+                                           info="勾选会把曲谱音符合并/拆分以匹配歌词音节数；"
+                                                "默认关闭，因为改谱会破坏原曲旋律复刻")
             seed_in = gr.Number(value=831001, precision=0, label="随机种子 seed")
             with gr.Row():
                 keep_ins_in = gr.Checkbox(value=False, label="跟随原曲伴奏旋律（Ins 声部）",
@@ -949,7 +938,7 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
                          outputs=[abc_out, step1_info, status_md])
     btn_generate.click(generate_cover,
                        inputs=[style_in, lyrics_in, abc_out, seed_in, keep_ins_in, keep_tempo_in,
-                               keep_chords_in, auto_align_in, cfg_in],
+                               keep_chords_in, auto_align_in, fit_notes_in, cfg_in],
                        outputs=[audio_out, step2_info, status_md])
     btn_align.click(auto_align_ui, inputs=[abc_out, lyrics_in], outputs=[abc_out, align_out])
     btn_cancel.click(cancel_generation, outputs=[step2_info])

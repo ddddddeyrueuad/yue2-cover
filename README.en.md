@@ -195,17 +195,22 @@ Lyrics **do not** need to align word-for-word with the original ABC: a cover fol
 The user supplies plain text; section tags, their order, and how many syllables each section gets are all decided by the score:
 
 - **Section mapping**: `% verse` → `[Verse]`, `% chorus` → `[Chorus]`, `% bridge` → `[Bridge]`; instrumental sections (`% intro`, `% interlude`, `% outro`, `% inst`, …) emit empty tags with no vocals. The order and repetition follow the score exactly (e.g. `verse → chorus → interlude → verse → chorus → outro`).
-- **Phrase-wise distribution**: each singing section receives exactly as many lyric syllables as its Vocal note onsets; the syllables are then split into phrases by per-measure onset counts (one line per measure), so line breaks land on musical phrase boundaries.
+- **Distribute by score line (the key rule)**: the unit is an **ABC music line**, not a single measure. Measured official data: the original lyrics of the same song are **28 lines** against **30 music lines** in the transcribed score's singing sections (≈1:1), about 12 syllables per line and onset/syllable ≈ 1.15. The model was trained with lyric lines and score lines at the same granularity; splitting per measure produces 2–3 syllable lines such as "写信 / 告诉我今 / 天海", which is nothing like the training distribution.
+- **Syllables per line = onsets of that line**: a strict one-to-one mapping, so lyric line boundaries and rhythmic density line up with the melody.
 - **Automatic loop padding**: when the total lyric syllables are fewer than the score requires, the complete lyric text is looped in order (repeating the whole text, not one word) so every singing section has words.
 - **Legacy tags**: if old lyrics containing `[Verse]` are pasted in, the tags are stripped and the structure is rebuilt from the score.
 - A score with no `%` comments is treated as a single `[Verse]`.
 
+> The official docs are explicit: YuE2 has **no** phoneme-to-note alignment channel — the lyric **line structure** is the only soft alignment mechanism. So the goal is to make lyric lines and score lines correspond at the same granularity, not to squeeze lyrics into the gaps between notes.
+
 ### Auto-alignment (🎯 button / on by default before generation)
 
-When you do not want to hand-edit the lyrics, let the tool put the lyric syllable count directly onto the Vocal voice:
+"生成前自动对齐" performs **structured-lyric alignment** (the section-driven generation above) and **never modifies the original notes** — the melody and rhythm fidelity of the source recording is fully preserved.
+
+A separate switch, "同时按歌词量改写音符时值" (off by default), enables the note-duration rewriting described below:
 
 - **Rule**: more syllables than notes → long notes are split (same pitch repeated as separate onsets); fewer syllables than notes → adjacent notes are merged (same-pitch pairs first, so no chord symbol is lost); if a measure ends up with a single note, it can be turned into a rest. Only the **note durations of the Vocal voice** change — per-measure total duration, chord symbols, the Ins voice, comments and line structure all stay identical.
-- **Two triggers**: the "🎯 自动对齐（写回曲谱）" button in step 2 rewrites the score box and shows the exact lyrics that will be sent to the model; "生成前自动对齐" is checked by default and runs "note-count alignment → structured-lyric alignment" during generation, logging both.
+- **Two triggers**: the "🎯 自动对齐（生成结构化歌词）" button in step 2 shows the exact lyrics that will be sent to the model; "生成前自动对齐" is checked by default and runs during generation, logging the result.
 - **Reversible**: alignment only stretches/shrinks durations, never changes the pitch sequence; running it twice with the same lyrics is idempotent.
 - **Limits**: measures with grace notes, chord blocks `[CEG]`, cross-bar ties or fractional durations are skipped conservatively, so extreme mismatches may leave a small residue — the report states "还差 N 个 onset".
 - **Hard bounds**: splitting can at most break a note down to one L: unit, and merging can at most reduce a measure to one note, so beyond that range you must adjust lyrics or score by hand.
