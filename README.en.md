@@ -209,7 +209,7 @@ The official skill assigns "turn the lyrics into something singable over the phr
 2. **LLM owns rewriting**: the grid plus your **original lyrics** go to the LLM with minimal-change instructions;
 3. **Code validates again**: singing-section order, line counts and per-line syllables must fit; otherwise it **falls back to the deterministic result**, so generation never fails because of the LLM. Validation tolerates two harmless differences: empty instrumental sections (`[Intro]`/`[Inst]`/`[Outro]`) may be omitted, and tags may carry numbers (`[Verse 1]`/`[Verse 2]`) — LLMs do this often and it should not discard a valid rewrite.
 
-Fill in the endpoint (default `https://api.deepseek.com/v1`), model and API key (or `LLM_API_KEY`) in the "🤖 LLM 改词" panel, enable it, and it runs during generation; "🧪 试跑 LLM 改词" previews without generation cost.
+Fill in the endpoint (default `https://api.deepseek.com/v1`), model and API key in the "🤖 LLM 改词" panel and click **"💾 保存设置"**: settings are written to a local `.llm.json` (plain text, listed in `.gitignore`, never committed) and restored automatically after a restart or page reload, so you do not retype the key. `LLM_API_KEY` also works. Enable it and it runs during generation; "🧪 试跑 LLM 改词" previews without generation cost.
 
 > Two hard limits: (1) YuE2 has **no** phoneme-to-note channel and the official docs forbid adding `w:`/phoneme annotations to the ABC, so any approach can only align *structure*, not guarantee which note a syllable lands on; (2) English syllables use a vowel-group heuristic (`Moonlight`→2, `make`→1); precise syllabification needs a pronunciation dictionary, so the LLM rewrite and listening remain the authority.
 

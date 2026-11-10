@@ -874,6 +874,56 @@ def llm_adapt_lyrics(abc, lyrics, base_url, api_key, model, temperature=0.7):
     return _strip_code_fence(content), "已通过结构校验"
 
 
+# ---------------------------------------------------------------- LLM 设置持久化
+LLM_CONFIG_FILE = ROOT / ".llm.json"
+
+
+def load_llm_config():
+    """读取本机保存的 LLM 设置；缺失时退回默认值与 LLM_API_KEY 环境变量。"""
+    try:
+        data = json.loads(LLM_CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    return ((data.get("base") or "").strip() or LLM_DEFAULT_BASE,
+            (data.get("model") or "").strip() or LLM_DEFAULT_MODEL,
+            (data.get("key") or "").strip() or os.environ.get("LLM_API_KEY", ""))
+
+
+def save_llm_config(base, model, key):
+    payload = {
+        "base": (base or "").strip() or LLM_DEFAULT_BASE,
+        "model": (model or "").strip() or LLM_DEFAULT_MODEL,
+        "key": (key or "").strip(),
+    }
+    try:
+        LLM_CONFIG_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                                   encoding="utf-8")
+    except OSError as exc:
+        return f"❌ 保存失败：{exc}"
+    try:                                    # 尽量收紧权限（Windows 上可能不支持，忽略）
+        os.chmod(LLM_CONFIG_FILE, 0o600)
+    except OSError:
+        pass
+    if payload["key"]:
+        return (f"✅ 已保存到 {LLM_CONFIG_FILE.name}（本机明文，已在 .gitignore 中）；"
+                "重启或刷新页面后自动回填。")
+    return f"✅ 已保存（API Key 为空）到 {LLM_CONFIG_FILE.name}。"
+
+
+def save_llm_ui(base, model, key):
+    info = save_llm_config(base, model, key)
+    log("LLM 设置：" + info)
+    return info
+
+
+def load_llm_ui():
+    """页面加载时回填已保存的设置（Gradio 每次打开页面都会调用）。"""
+    return load_llm_config()
+
+
+_llm_cfg = load_llm_config()
+
+
 def prepare_abc(abc, keep_ins, keep_tempo, keep_chords):
     """按选择预处理转录曲谱，并决定生成模式 cot：
 
@@ -1138,11 +1188,16 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
                 with gr.Row():
                     llm_on_in = gr.Checkbox(value=False, label="启用 LLM 改词",
                                             info="需要联网与 API 费用；失败不影响生成")
-                    llm_model_in = gr.Textbox(value=LLM_DEFAULT_MODEL, label="模型", scale=1)
-                llm_base_in = gr.Textbox(value=LLM_DEFAULT_BASE, label="接口地址（OpenAI 兼容 base_url）")
-                llm_key_in = gr.Textbox(value=os.environ.get("LLM_API_KEY", ""), label="API Key",
-                                        type="password", info="只保存在本进程内存；也可用环境变量 LLM_API_KEY")
-                btn_llm = gr.Button("🧪 试跑 LLM 改词（只预览，不改生成参数）")
+                    llm_model_in = gr.Textbox(value=_llm_cfg[1], label="模型", scale=1)
+                llm_base_in = gr.Textbox(value=_llm_cfg[0], label="接口地址（OpenAI 兼容 base_url）")
+                llm_key_in = gr.Textbox(value=_llm_cfg[2], label="API Key",
+                                        type="password",
+                                        info="点「保存设置」后会存到本机 .llm.json（明文，已加入 .gitignore），"
+                                             "重启/刷新自动回填；也可用环境变量 LLM_API_KEY")
+                with gr.Row():
+                    btn_llm_save = gr.Button("💾 保存设置")
+                    btn_llm = gr.Button("🧪 试跑 LLM 改词（只预览，不改生成参数）")
+                llm_save_info = gr.Textbox(label="设置状态", lines=1, interactive=False)
             with gr.Row():
                 btn_generate = gr.Button("🎧 生成翻唱", variant="primary")
                 btn_cancel = gr.Button("⏹ 取消生成")
@@ -1167,6 +1222,10 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
     btn_align.click(auto_align_ui, inputs=[abc_out, lyrics_in], outputs=[abc_out, align_out])
     btn_llm.click(llm_preview, inputs=[abc_out, lyrics_in, llm_base_in, llm_key_in, llm_model_in],
                   outputs=[align_out])
+    btn_llm_save.click(save_llm_ui, inputs=[llm_base_in, llm_model_in, llm_key_in],
+                       outputs=[llm_save_info])
+    # 每次打开页面回填已保存的 LLM 设置（否则刷新后就变回启动时的默认值）
+    demo.load(load_llm_ui, outputs=[llm_base_in, llm_model_in, llm_key_in])
     btn_cancel.click(cancel_generation, outputs=[step2_info])
     btn_preload.click(preload_model, outputs=[preload_info, status_md])
     for comp in (abc_out, lyrics_in):

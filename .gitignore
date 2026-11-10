@@ -14,6 +14,11 @@ models/
 outputs/
 gradio/
 
+# ===== 本机敏感配置（LLM API Key 等，绝不入库）=====
+.llm.json
+*.secret
+*.key
+
 # ===== 测试音频 =====
 test_tone.wav
 
