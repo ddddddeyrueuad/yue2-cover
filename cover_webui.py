@@ -777,7 +777,8 @@ def _llm_messages(grid, lyrics):
         "1) 只输出歌唱段（网格里给了目标音节数的段），顺序必须与网格一致；"
         "标注为乐器段的段落可以整段省略，也可以保留一个空标记；段落标记可带序号如 [Verse 1]；\n"
         "2) 每个歌唱段的行数必须与网格给出的行数完全一致；\n"
-        "3) 每行音节数尽量等于该行目标值（±1 可接受）；中文一字符一音节，英文按实际发音音节；\n"
+        "3) 每行必须逐行数着写：中文歌词按字符数、英文按实际发音音节数，"
+        "精确等于该行目标值（允许 ±1，绝不要多写，多写会导致演唱吞字）；\n"
         "4) 尽量保留用户原句与原意，只做必要的断句、增删字或整句重复，不要重新创作整首；\n"
         "5) 只输出歌词文本：先是 [Tag]，然后是该段歌词行，行与行之间换行；"
         "不要解释、不要代码块、不要编号。"
@@ -857,21 +858,38 @@ def validate_structured(text, grid):
     return True, "ok"
 
 
-def llm_adapt_lyrics(abc, lyrics, base_url, api_key, model, temperature=0.7):
-    """让 LLM 把歌词改写成贴合网格的版本；失败时返回 (None, 原因) 由调用方回落。"""
+def llm_adapt_lyrics(abc, lyrics, base_url, api_key, model, temperature=0.7, retries=1):
+    """让 LLM 把歌词改写成贴合网格的版本；校验失败会带着具体错误重试一次。
+
+    最终失败返回 (None, 原因)，由调用方回落到本地确定性结果。"""
     if not (api_key or "").strip():
         return None, "未配置 API key"
     grid = score_grid(abc)
     if not any(g["targets"] for g in grid):
         return None, "曲谱没有歌唱段落"
-    try:
-        content = _llm_chat(base_url, api_key, model, _llm_messages(grid, lyrics), temperature)
-    except Exception as exc:
-        return None, f"调用失败：{exc}"
-    ok, why = validate_structured(content, grid)
-    if not ok:
-        return None, f"结构校验未通过（{why}）"
-    return _strip_code_fence(content), "已通过结构校验"
+    messages = _llm_messages(grid, lyrics)
+    last = ""
+    for attempt in range(retries + 1):
+        try:
+            content = _llm_chat(base_url, api_key, model, messages, temperature)
+        except Exception as exc:
+            return None, f"调用失败：{exc}"
+        ok, why = validate_structured(content, grid)
+        if ok:
+            note = "已通过结构校验" if attempt == 0 else f"第 {attempt + 1} 次尝试通过"
+            return _strip_code_fence(content), note
+        last = why
+        if attempt < retries:
+            log(f"LLM 改词第 {attempt + 1} 版不合格（{why}），带错误信息重试…")
+            messages = messages + [
+                {"role": "assistant", "content": _strip_code_fence(content)},
+                {"role": "user", "content": (
+                    f"上一版未通过结构校验：{why}。\n"
+                    "请只修正结构后重新输出：段落顺序与歌唱段行数保持不变；"
+                    "逐行字数必须精确等于该行目标值（中文按字符数计，允许 ±1）。\n"
+                    "不要解释，不要代码块，只输出歌词文本。")},
+            ]
+    return None, f"结构校验未通过（{last}）"
 
 
 # ---------------------------------------------------------------- LLM 设置持久化

@@ -22,6 +22,7 @@ CN = "\n".join(["写信告诉我今天 海是什么颜色", "夜夜陪着你的�
 
 GRID = cw.score_grid(real)
 CAPTURED = {}
+CALLS = {}
 
 
 def build_valid_lyrics():
@@ -60,6 +61,14 @@ def build_numbered():
     return re.sub(r"\[(Verse|Chorus)\]", repl, txt)
 
 
+def build_bad_syllables():
+    """结构对、但某一行音节超标（复现用户遇到的 '[Verse] 第 2 行音节 15 偏离目标 10'）。"""
+    lines = build_valid_lyrics().split("\n")
+    idx = next(i for i, ln in enumerate(lines) if ln.startswith("词"))
+    lines[idx] = lines[idx] + "多" * 5
+    return "\n".join(lines)
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
@@ -68,10 +77,15 @@ class Handler(BaseHTTPRequestHandler):
         CAPTURED["auth"] = self.headers.get("Authorization")
         CAPTURED["body"] = body
         mode = self.path.split("/")[1] if "/" in self.path else ""
-        if mode == "bad":                       # 返回结构不合格的内容
+        CALLS[mode] = CALLS.get(mode, 0) + 1
+        if mode == "bad":                       # 结构不合格
             content = "[Verse]\n短\n"
         elif mode == "fence":                   # 带代码块围栏，应被剥离
             content = "```\n" + build_valid_lyrics() + "\n```"
+        elif mode == "fix":                     # 第一次不合格，重试后合格
+            content = build_valid_lyrics() if CALLS[mode] > 1 else build_bad_syllables()
+        elif mode == "always_bad":              # 始终超标：应最终回落
+            content = build_bad_syllables()
         elif mode == "boom":                    # 服务端错误
             self.send_response(500)
             self.end_headers()
@@ -149,6 +163,19 @@ swapped = "\n".join(f"[{g['tag']}]\n" + "\n".join("词" * t for t in g["targets"
 ok_e, why_e = cw.validate_structured(swapped, GRID)
 print("段落顺序错:", ok_e, why_e)
 assert not ok_e
+
+print("\n=== 8. 音节超标应带错误重试一次并成功 ===")
+t8, n8 = cw.llm_adapt_lyrics(real, CN, base + "/fix/v1", "sk-test", "m")
+print("结果:", n8, "| 调用次数:", CALLS.get("fix"))
+assert t8, n8
+assert CALLS.get("fix") == 2, f"应重试一次，实际调用 {CALLS.get('fix')} 次"
+assert cw.validate_structured(t8, GRID)[0]
+
+print("\n=== 9. 始终不合格应最终回落 ===")
+t9, n9 = cw.llm_adapt_lyrics(real, CN, base + "/always_bad/v1", "sk-test", "m")
+print("结果:", (t9, n9), "| 调用次数:", CALLS.get("always_bad"))
+assert t9 is None and "校验未通过" in n9
+assert CALLS.get("always_bad") == 2, "默认只重试一次"
 
 srv.shutdown()
 print("\nALL OK")
