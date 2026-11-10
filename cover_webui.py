@@ -32,6 +32,9 @@ warnings.filterwarnings("ignore", message="'HTTP_422_UNPROCESSABLE_ENTITY' is de
 
 import gradio as gr  # noqa: E402
 
+# 版本号：改了 cover_webui.py 必须重启服务才会生效，用这个号确认跑的是新代码
+APP_VERSION = "1.4.0"   # 1.4.0: LLM 改词校验容忍空乐器段/序号标记，LLM 输入改为原始歌词
+
 MODEL_DIR = ROOT / "models" / "YuE2-3B"
 VAE_DIR = ROOT / "models" / "YuE2-Vae"
 SHEET_DIR = ROOT / "models" / "SheetSage2"
@@ -1080,6 +1083,7 @@ EXAMPLE_ABC = (ROOT / "YuE" / "examples" / "melody.abc")
 with gr.Blocks(title="YuE2 翻唱工作台") as demo:
     gr.Markdown(
         "# 🎵 YuE2 翻唱（Cover）工作台\n"
+        f"<sub>代码版本 v{APP_VERSION}（改了代码需重启服务才生效）</sub>\n\n"
         "**流程：** ① 上传源歌曲音频 → ② SheetSage2 自动转录出旋律曲谱（ABC，含和弦）→ "
         "③ 填写目标风格与歌词 → ④ YuE2 生成翻唱（可 COVER 原曲和弦走向，歌词无需逐字对齐）。\n"
         "转录与生成共用 GPU，请顺序操作；生成一首通常需要数分钟，请耐心等待。"
@@ -1177,4 +1181,5 @@ if __name__ == "__main__":
     for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
         os.environ.pop(var, None)
     os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
+    log(f"cover_webui v{APP_VERSION} 已启动（改动代码后需重启本服务才生效）")
     demo.launch(server_name="127.0.0.1", server_port=7860, theme=gr.themes.Soft(), inbrowser=False)
