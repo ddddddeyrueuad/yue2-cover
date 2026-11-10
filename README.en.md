@@ -196,10 +196,22 @@ The user supplies plain text; section tags, their order, and how many syllables 
 
 - **Section mapping**: `% verse` → `[Verse]`, `% chorus` → `[Chorus]`, `% bridge` → `[Bridge]`; instrumental sections (`% intro`, `% interlude`, `% outro`, `% inst`, …) emit empty tags with no vocals. The order and repetition follow the score exactly (e.g. `verse → chorus → interlude → verse → chorus → outro`).
 - **Distribute by score line (the key rule)**: the unit is an **ABC music line**, not a single measure. Measured official data: the original lyrics of the same song are **28 lines** against **30 music lines** in the transcribed score's singing sections (≈1:1), about 12 syllables per line and onset/syllable ≈ 1.15. The model was trained with lyric lines and score lines at the same granularity; splitting per measure produces 2–3 syllable lines such as "写信 / 告诉我今 / 天海", which is nothing like the training distribution.
-- **Syllables per line = onsets of that line**: a strict one-to-one mapping, so lyric line boundaries and rhythmic density line up with the melody.
-- **Automatic loop padding**: when the total lyric syllables are fewer than the score requires, the complete lyric text is looped in order (repeating the whole text, not one word) so every singing section has words.
+- **Syllables per line ≈ 0.9 × the line's onsets, with tolerance**: not strictly equal any more. The official reference lyrics for the same song measure 337 syllables / 388 onsets ≈ 0.87, with per-line deviations up to ±5 (the model uses melisma across notes). Forcing exact equality chopped words mid-sentence and duplicated fragments, which itself caused misalignment.
+- **Whole lines first, never split words**: a line whose length is close to the score line is kept whole; it is only split at word boundaries when clearly too long. Missing lyrics are padded by cycling **whole lines** (repeating the block, not one word), so every singing section has words.
 - **Legacy tags**: if old lyrics containing `[Verse]` are pasted in, the tags are stripped and the structure is rebuilt from the score.
 - A score with no `%` comments is treated as a single `[Verse]`.
+
+### LLM lyric adaptation (optional, OpenAI-compatible)
+
+The official skill assigns "turn the lyrics into something singable over the phrases" to an agent (LLM) — `editing-workflows.md` asks to check syllable count, lexical stress, consonant density on short notes, vowels on held notes and breathing points, and states that matching the total syllable count alone is insufficient. This tool follows that split:
+
+1. **Code owns structure**: it computes the grid (section order, lines per section, target syllables per line) deterministically;
+2. **LLM owns rewriting**: the grid plus your lyrics go to the LLM with minimal-change instructions;
+3. **Code validates again**: section order, line counts and per-line syllables must fit; otherwise it **falls back to the deterministic result**, so generation never fails because of the LLM.
+
+Fill in the endpoint (default `https://api.deepseek.com/v1`), model and API key (or `LLM_API_KEY`) in the "🤖 LLM 改词" panel, enable it, and it runs during generation; "🧪 试跑 LLM 改词" previews without generation cost.
+
+> Two hard limits: (1) YuE2 has **no** phoneme-to-note channel and the official docs forbid adding `w:`/phoneme annotations to the ABC, so any approach can only align *structure*, not guarantee which note a syllable lands on; (2) English syllables use a vowel-group heuristic (`Moonlight`→2, `make`→1); precise syllabification needs a pronunciation dictionary, so the LLM rewrite and listening remain the authority.
 
 > The official docs are explicit: YuE2 has **no** phoneme-to-note alignment channel — the lyric **line structure** is the only soft alignment mechanism. So the goal is to make lyric lines and score lines correspond at the same granularity, not to squeeze lyrics into the gaps between notes.
 

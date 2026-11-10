@@ -500,9 +500,11 @@ def auto_align_abc(abc, lyrics):
 
 
 def count_lyric_syllables(lyrics):
-    """歌词音节数：中日韩字符按字计，拉丁文按词计（段落标记 [Verse] 等不计）。"""
+    """歌词音节数：CJK 按字、英文按估算音节（段落标记 [Verse] 等不计）。
+
+    英文不再按「词」计——「Moonlight」是 2 个音节而非 1 个，按词计会系统性少算。"""
     text = re.sub(r"\[[^\]]*\]", " ", lyrics)
-    return len(_CJK_RE.findall(text)) + len(_LATIN_RE.findall(text))
+    return sum(w for _, w in _syllable_units(text))
 
 
 def alignment_hint(abc, lyrics, keep_ins):
@@ -597,10 +599,45 @@ def _split_lyric_lines(lyrics):
     return lines
 
 
+_VOWEL_GROUP_RE = re.compile(r"[aeiouy]+")
+
+
+def _en_syllables(word):
+    """英文单词音节数粗估（元音组启发式）。
+
+    比「按词计 1 个」更接近实际演唱：「Moonlight」→2、「tonight」→2、
+    「make」→1（词尾不发音 e）、「little」→2（le 结尾成音节）。
+    精确音节需要发音词典；这里只用于目标估算与预览，最终由 LLM/人工把握。"""
+    w = word.lower()
+    if not re.search(r"[a-z]", w):
+        return 1
+    groups = len(_VOWEL_GROUP_RE.findall(w))
+    if groups == 0:
+        return 1
+    if w.endswith("e") and not w.endswith(("le", "ee", "ye")) and groups > 1:
+        groups -= 1
+    return max(1, groups)
+
+
 def _syllable_units(text):
-    """把一行歌词拆成「音节单元」：CJK 每字一个、拉丁每词一个，保留顺序与文本。"""
-    return [(m.group(0), m.group(0)) for m in re.finditer(
-        r"[\u3400-\u9fff\uf900-\ufaff]|[A-Za-z]+|[^\sA-Za-z\u3400-\u9fff\uf900-\ufaff]+", text)]
+    """把一行歌词拆成音节单元 (文本, 音节数)。
+
+    CJK 每字 1 音节；拉丁按词估算音节；标点并入前一个单元、不计音节。
+    """
+    units = []
+    for m in re.finditer(r"[\u3400-\u9fff\uf900-\ufaff]|[A-Za-z]+(?:['’][A-Za-z]+)?|"
+                         r"[^\sA-Za-z\u3400-\u9fff\uf900-\ufaff]+", text):
+        tok = m.group(0)
+        if _CJK_RE.match(tok):
+            units.append((tok, 1))
+        elif re.match(r"[A-Za-z]", tok):
+            units.append((tok, _en_syllables(tok)))
+        elif units:
+            prev_text, prev_w = units[-1]
+            units[-1] = (prev_text + tok, prev_w)   # 标点并入前一个单元
+        else:
+            units.append((tok, 0))
+    return units
 
 
 def _line_units(lines):
@@ -610,47 +647,60 @@ def _line_units(lines):
 def _join_units(units):
     """把音节单元拼回可读文本：CJK 相连不加空格，拉丁词用空格。"""
     out = ""
-    for u in units:
+    for text, _w in units:
         if not out:
-            out = u
-        elif re.match(r"[\u3400-\u9fff\uf900-\ufaff]", u[-1]) and \
-                re.match(r"[\u3400-\u9fff\uf900-\ufaff]", out[-1]):
-            out += u
+            out = text
+        elif _CJK_RE.match(text[0]) or _CJK_RE.match(out[-1]):
+            out += text
         else:
-            out += " " + u
+            out += " " + text
     return out
 
 
-def _distribute_by_lines(line_onsets, units, boundaries):
-    """把音节池按「每个曲谱行的 onset 数」切成歌词行。
+def _fit_phrases(targets, user_lines):
+    """把用户歌词铺到曲谱各行：整句优先、允许浮动、不足时整句循环。
 
-    严格保证每行音节数 == 该行 onset 数（这是对齐的核心不变量）。
-    若某行的切点恰好落在用户原始行边界上，则该行保持原始断句语义。
-    返回 [[音节文本, ...], ...]（长度 = 行数）。"""
-    total = sum(line_onsets)
-    flat = [u[0] for lu in units for u in lu]
-    if not flat or total <= 0:
+    targets 为每个曲谱行的 onset 数；每行目标音节 ≈ 0.9 × onset（官方参考词
+    实测 337 音节 / 388 onset ≈ 0.87，允许一个音节跨多个音）。
+    不拆词、不拆句：只有单句明显超长时才在词边界切开。
+    """
+    lines = [toks for toks in user_lines if sum(w for _, w in toks) > 0]
+    if not lines or not targets:
         return []
-    pool = []
-    while len(pool) < total:
-        pool.extend(flat)
-    pool = pool[:total]
-    result, pos = [], 0
-    for o in line_onsets:
-        end = min(pos + o, len(pool))
-        result.append(pool[pos:end])
-        pos = end
-    if pos < len(pool):
-        result[-1] = result[-1] + pool[pos:]
-    return result
+    res, idx = [], 0
+    toks = list(lines[0])
+    for t in targets:
+        want = max(1, int(round(t * 0.9)))
+        if not toks:                       # 当前行已用尽 → 取下一句（循环）
+            idx = (idx + 1) % len(lines)
+            toks = list(lines[idx])
+        cur = sum(w for _, w in toks)
+        # 整句优先：当前句完整且长度在目标的 0.7–1.3 倍内 → 整句放进这一行
+        if 0.7 * t <= cur <= 1.3 * t:
+            res.append(list(toks))
+            toks = []
+            continue
+        chunk, syl = [], 0
+        while syl < want:
+            if not toks:                   # 行内取完 → 续下一句（长句续写）
+                idx = (idx + 1) % len(lines)
+                toks = list(lines[idx])
+            text, w = toks[0]
+            if chunk and syl + w > want * 1.45:
+                break
+            chunk.append((text, w))
+            syl += w
+            toks.pop(0)
+        res.append(chunk)
+    return res
 
 
 def align_lyrics_to_abc(abc, lyrics):
-    """由 ABC 谱自动生成结构化歌词（段落标记 + 与曲谱行一一对应的歌词行）。
+    """由 ABC 谱自动生成结构化歌词（段落标记 + 与曲谱行对应的歌词行）。
 
     用户歌词框只收纯歌词文本；段落标记、段落顺序、每行歌词量全部由曲谱的
     % section 注释与各行 Vocal 音符数决定。乐器段落输出空标记；歌词不足时
-    自动循环补齐。返回 (结构化歌词, 预览文本)。"""
+    按整句循环补齐。返回 (结构化歌词, 预览文本)。"""
     sections = abc_sections(abc)
     if not sections:
         return lyrics, "曲谱没有可识别的 Vocal 段落，未做结构化对齐。"
@@ -662,16 +712,11 @@ def align_lyrics_to_abc(abc, lyrics):
     if not lines_txt:
         return lyrics, "歌词为空，未做结构化对齐。"
     units = _line_units(lines_txt)
-    total_syllables = sum(len(u) for u in units)
-    boundaries, acc = set(), 0
-    for lu in units:
-        acc += len(lu)
-        boundaries.add(acc)
+    total_syllables = sum(w for lu in units for _, w in lu)
     total_onsets = sum(o for _, _, ls in sing for o, _ in ls)
     seg_lines = {}
     for i, label, ls in sing:
-        seg_lines[i] = _distribute_by_lines([o for o, _ in ls], units, boundaries)
-    # 拼装：乐器段落输出空标记
+        seg_lines[i] = _fit_phrases([o for o, _ in ls], units)
     out_lines, preview = [], []
     for i, (label, ls) in enumerate(sections):
         tag = _section_tag(label)
@@ -680,7 +725,7 @@ def align_lyrics_to_abc(abc, lyrics):
             seg = seg_lines[i]
             for phrase in seg:
                 out_lines.append(_join_units(phrase))
-            got = sum(len(p) for p in seg)
+            got = sum(w for p in seg for _, w in p)
             preview.append(f"[{tag}] {len(ls)} 行 / {sum(o for o, _ in ls)} 音符 → {len(seg)} 句 / {got} 音节")
         else:
             preview.append(f"[{tag}] 乐器段，无歌词")
@@ -688,9 +733,129 @@ def align_lyrics_to_abc(abc, lyrics):
     result = "\n".join(out_lines).rstrip() + "\n"
     report = ("✅ 已按曲谱自动对齐歌词结构：" + "；".join(preview)
               + (f"。原始歌词 {total_syllables} 音节，曲谱歌唱段共 {total_onsets} 个 onset，"
-                 "已自动循环补齐。" if total_syllables < total_onsets else
+                 "已按整句循环补齐。" if total_syllables < total_onsets else
                  f"。原始歌词 {total_syllables} 音节 / 曲谱歌唱段 {total_onsets} 个 onset。"))
     return result, report
+
+
+# ---------------------------------------------------------------- LLM 改词（可选）
+LLM_DEFAULT_BASE = "https://api.deepseek.com/v1"
+LLM_DEFAULT_MODEL = "deepseek-chat"
+
+
+def score_grid(abc):
+    """给 LLM 的结构摘要：段落顺序 + 每段行数 + 每行目标音节数（≈0.9×onset）。"""
+    grid = []
+    for label, lines in abc_sections(abc):
+        tag = _section_tag(label)
+        onsets = [o for o, _ in lines]
+        if tag in _INST_TAGS or not onsets or sum(onsets) == 0:
+            grid.append({"tag": tag, "targets": []})
+        else:
+            grid.append({"tag": tag, "targets": [max(1, int(round(o * 0.9))) for o in onsets]})
+    return grid
+
+
+def _grid_text(grid):
+    parts = []
+    for g in grid:
+        if not g["targets"]:
+            parts.append(f"[{g['tag']}]（乐器段，不要写歌词）")
+        else:
+            parts.append(f"[{g['tag']}] 需要 {len(g['targets'])} 行，"
+                         f"各行目标音节数: {g['targets']}")
+    return "\n".join(parts)
+
+
+def _llm_messages(grid, lyrics):
+    system = (
+        "你是中文/英文歌曲的作词与改编助手。任务：把用户歌词改编成能贴着给定旋律网格演唱的版本。\n"
+        "硬性要求：\n"
+        "1) 段落标记与顺序必须与网格完全一致；标注为乐器段的段落不要写歌词；\n"
+        "2) 每个歌唱段的行数必须与网格给出的行数完全一致；\n"
+        "3) 每行音节数尽量等于该行目标值（±1 可接受）；中文一字符一音节，英文按实际发音音节；\n"
+        "4) 尽量保留用户原句与原意，只做必要的断句、增删字或整句重复，不要重新创作整首；\n"
+        "5) 只输出歌词文本：先是 [Tag]，然后是该段歌词行，行与行之间换行；"
+        "不要解释、不要代码块、不要编号。"
+    )
+    user = ("旋律网格：\n" + _grid_text(grid) +
+            "\n\n用户歌词：\n" + lyrics.strip() +
+            "\n\n请输出贴合上述网格的歌词。")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _strip_code_fence(text):
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[A-Za-z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def _llm_chat(base_url, api_key, model, messages, temperature=0.7, timeout=180):
+    """OpenAI 兼容 /chat/completions（标准库实现，不引入额外依赖）。"""
+    import urllib.request
+    url = (base_url or LLM_DEFAULT_BASE).rstrip("/") + "/chat/completions"
+    payload = json.dumps({"model": model or LLM_DEFAULT_MODEL, "messages": messages,
+                          "temperature": temperature}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key.strip()}",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
+
+
+def parse_structured_lyrics(text):
+    """把 (可能是 LLM 输出的) 文本解析成 [(tag, [line, ...])]。"""
+    sections, cur = [], None
+    for ln in _strip_code_fence(text).replace("\r\n", "\n").split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        m = _STRUCT_TAG_RE.match(s)
+        if m:
+            cur = (m.group(1).strip(), [])
+            sections.append(cur)
+        elif cur is not None:
+            cur[1].append(s)
+    return sections
+
+
+def validate_structured(text, grid):
+    """校验 LLM 输出是否满足网格：段落顺序、行数、每行音节接近目标。"""
+    got = parse_structured_lyrics(text)
+    if len(got) != len(grid):
+        return False, f"段落数 {len(got)} != 期望 {len(grid)}"
+    for (tag, lines), g in zip(got, grid):
+        if tag != g["tag"]:
+            return False, f"段落标记 {tag} != 期望 {g['tag']}"
+        want = len(g["targets"])
+        if len(lines) != want:
+            return False, f"[{tag}] 行数 {len(lines)} != 期望 {want}"
+        for j, (ln, t) in enumerate(zip(lines, g["targets"]), 1):
+            syl = count_lyric_syllables(ln)
+            if abs(syl - t) > max(2, int(t * 0.35)):
+                return False, f"[{tag}] 第 {j} 行音节 {syl} 偏离目标 {t}"
+    return True, "ok"
+
+
+def llm_adapt_lyrics(abc, lyrics, base_url, api_key, model, temperature=0.7):
+    """让 LLM 把歌词改写成贴合网格的版本；失败时返回 (None, 原因) 由调用方回落。"""
+    if not (api_key or "").strip():
+        return None, "未配置 API key"
+    grid = score_grid(abc)
+    if not any(g["targets"] for g in grid):
+        return None, "曲谱没有歌唱段落"
+    try:
+        content = _llm_chat(base_url, api_key, model, _llm_messages(grid, lyrics), temperature)
+    except Exception as exc:
+        return None, f"调用失败：{exc}"
+    ok, why = validate_structured(content, grid)
+    if not ok:
+        return None, f"结构校验未通过（{why}）"
+    return _strip_code_fence(content), "已通过结构校验"
 
 
 def prepare_abc(abc, keep_ins, keep_tempo, keep_chords):
@@ -742,7 +907,8 @@ def prepare_abc(abc, keep_ins, keep_tempo, keep_chords):
     return "\n".join(out), "；".join(notes), cot
 
 
-def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, auto_align, fit_notes, cfg_scale):
+def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, auto_align, fit_notes,
+                   llm_on, llm_base, llm_key, llm_model, cfg_scale):
     if not abc or not abc.strip():
         return None, "缺少 ABC 曲谱。请先转录，或手动粘贴曲谱。", model_status_text()
     if not style or not style.strip():
@@ -761,7 +927,16 @@ def generate_cover(style, lyrics, abc, seed, keep_ins, keep_tempo, keep_chords, 
             lyrics, struct_note = align_lyrics_to_abc(abc, lyrics)
             log("歌词结构对齐：" + struct_note)
             align_note = struct_note
-            # ② 可选：按歌词音节数改写音符时值（会改变原曲节奏，默认关闭）
+            # ② 可选：LLM 把歌词改写成贴合网格的版本（失败自动回落到 ①）
+            if llm_on:
+                llm_lyrics, llm_note = llm_adapt_lyrics(abc, lyrics, llm_base, llm_key, llm_model)
+                if llm_lyrics:
+                    lyrics = llm_lyrics
+                    log("LLM 改词：" + llm_note)
+                    align_note += "；LLM 改词完成"
+                else:
+                    log("LLM 改词跳过：" + llm_note + "（使用确定性结构对齐结果）")
+            # ③ 可选：按歌词音节数改写音符时值（会改变原曲节奏，默认关闭）
             if fit_notes:
                 abc, fit_note = auto_align_abc(abc, lyrics)
                 log("音符时值改写：" + fit_note)
@@ -843,6 +1018,21 @@ def align_preview(abc, lyrics):
         return f"预览失败：{exc}"
 
 
+def llm_preview(abc, lyrics, base, key, model):
+    """试跑 LLM 改词：只返回预览文本，不改变生成参数、不写回输入框。"""
+    if not abc or not abc.strip():
+        return "缺少 ABC 曲谱。"
+    if not lyrics or not lyrics.strip():
+        return "请先填写歌词。"
+    structured, report = align_lyrics_to_abc(abc, lyrics)
+    text, note = llm_adapt_lyrics(abc, structured, base, key, model)
+    if not text:
+        return (f"{report}\n\n❌ LLM 改词未采用：{note}\n"
+                f"（生成时会回落到上面的本地确定性结果）")
+    log("LLM 试跑成功：" + note)
+    return (f"{report}\n\n✅ LLM 改词（{note}），生成时实际发送：\n\n{text}")
+
+
 def poll_log(last):
     lines = []
     try:
@@ -920,6 +1110,20 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
             cfg_in = gr.Slider(minimum=1.0, maximum=10.0, value=1.2, step=0.1,
                                label="风格引导强度 cfg_scale",
                                info="越高越贴合风格提示词（官方建议从 1.2 起实验，过高可能影响音质；1.0=关闭引导且更快）")
+            with gr.Accordion("🤖 LLM 改词（可选，OpenAI 兼容接口）", open=False):
+                gr.Markdown(
+                    "官方把「把歌词改写成能贴合乐句演唱的版本」交给 agent（LLM）；"
+                    "本工具先把曲谱算成网格（段落/行数/每行目标音节数），再让 LLM 按网格改写，"
+                    "输出会做结构校验，不合格自动回落到本地确定性结果。"
+                )
+                with gr.Row():
+                    llm_on_in = gr.Checkbox(value=False, label="启用 LLM 改词",
+                                            info="需要联网与 API 费用；失败不影响生成")
+                    llm_model_in = gr.Textbox(value=LLM_DEFAULT_MODEL, label="模型", scale=1)
+                llm_base_in = gr.Textbox(value=LLM_DEFAULT_BASE, label="接口地址（OpenAI 兼容 base_url）")
+                llm_key_in = gr.Textbox(value=os.environ.get("LLM_API_KEY", ""), label="API Key",
+                                        type="password", info="只保存在本进程内存；也可用环境变量 LLM_API_KEY")
+                btn_llm = gr.Button("🧪 试跑 LLM 改词（只预览，不改生成参数）")
             with gr.Row():
                 btn_generate = gr.Button("🎧 生成翻唱", variant="primary")
                 btn_cancel = gr.Button("⏹ 取消生成")
@@ -938,9 +1142,12 @@ with gr.Blocks(title="YuE2 翻唱工作台") as demo:
                          outputs=[abc_out, step1_info, status_md])
     btn_generate.click(generate_cover,
                        inputs=[style_in, lyrics_in, abc_out, seed_in, keep_ins_in, keep_tempo_in,
-                               keep_chords_in, auto_align_in, fit_notes_in, cfg_in],
+                               keep_chords_in, auto_align_in, fit_notes_in,
+                               llm_on_in, llm_base_in, llm_key_in, llm_model_in, cfg_in],
                        outputs=[audio_out, step2_info, status_md])
     btn_align.click(auto_align_ui, inputs=[abc_out, lyrics_in], outputs=[abc_out, align_out])
+    btn_llm.click(llm_preview, inputs=[abc_out, lyrics_in, llm_base_in, llm_key_in, llm_model_in],
+                  outputs=[align_out])
     btn_cancel.click(cancel_generation, outputs=[step2_info])
     btn_preload.click(preload_model, outputs=[preload_info, status_md])
     for comp in (abc_out, lyrics_in):

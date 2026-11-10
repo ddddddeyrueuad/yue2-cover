@@ -23,7 +23,7 @@ git apply patches\SheetSage2-beat-grid-fill.patch
 |---|---|
 | 上游 / Upstream | [multimodal-art-projection/YuE](https://github.com/multimodal-art-projection/YuE) @ `1647252`（2026-10-06），已含本项目的 Windows 补丁 / carries the local Windows patches |
 | 本地补丁 / Local patches | 4 个（2 个在 `YuE\`，1 个在 `patches\`，1 个在 `cover_webui.py`）/ 2 in `YuE\`, 1 in `patches\`, 1 in `cover_webui.py` |
-| 验证脚本 / Validation scripts | [`tools\probe_gqa_attention.py`](tools/probe_gqa_attention.py)、[`tools\validate_full_song.py`](tools/validate_full_song.py) |
+| 验证脚本 / Validation scripts | [`tools\probe_gqa_attention.py`](tools/probe_gqa_attention.py)、[`tools\validate_full_song.py`](tools/validate_full_song.py)、[`tools\test_lyric_structure.py`](tools/test_lyric_structure.py)、[`tools\test_llm_adapter.py`](tools/test_llm_adapter.py) |
 | 硬件 / Hardware | 2 × RTX 3080 20 GB（官方建议 24 GB / official recommendation is 24 GB） |
 | 实测 / Measured | 5.4 分钟整首歌 = 686 s（AR 129 s + NAR 547 s + VAE 8 s），峰值显存 2 GiB / a 5.4-min song in 686 s, 2 GiB peak VRAM |
 | 不入库 / Not committed | `models\`、`outputs\`、`.venv*\`、`.hfcache\`（见 `.gitignore`） |
